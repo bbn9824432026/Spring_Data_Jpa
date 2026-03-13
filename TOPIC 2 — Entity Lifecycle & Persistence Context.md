@@ -940,3 +940,539 @@ Flush triggers      = commit / explicit flush() / pre-query (AUTO mode)
 ```
 
 ---
+
+---
+
+## The Persistence Context Internals
+
+**Q1. What are the three main data structures inside `StatefulPersistenceContext`? What is the purpose of each?**
+
+**Identity Map (`entitiesByKey`)** — A `Map<EntityKey, Object>` where the key is (entity type + primary key). Guarantees that within one PC, there is exactly one Java instance per DB row. Every `find()` checks here first before hitting the DB.
+
+**Snapshots (`entitySnapshotsByKey`)** — A deep copy of each entity's field values captured at load time. Used by dirty checking at flush time — Hibernate compares current field values against this snapshot to decide whether to generate an UPDATE.
+
+**ActionQueue** — Holds all pending SQL operations (inserts, updates, deletes) that haven't been sent to the DB yet. Flushed as a batch at commit time or when explicitly triggered.
+
+---
+
+**Q2. What is the "loaded state snapshot" and when exactly is it created?**
+
+The snapshot is a deep copy of the entity's field values captured at the moment the entity enters the Persistence Context. It is created at:
+
+- `em.find()` — after loading from DB
+- `em.persist()` — after registering a new entity
+- `em.merge()` — on the returned managed instance
+- JPQL query results — after hydrating each result row
+
+At flush time, Hibernate compares current field values against this snapshot. If anything differs → UPDATE is generated. If nothing changed → no SQL.
+
+---
+
+**Q3. What is the `ActionQueue`? What types of actions does it hold, and in what order?**
+
+The ActionQueue is a buffer of pending SQL operations accumulated during a transaction. Execution order:
+
+```
+1. OrphanRemovalAction      ← orphan collection elements
+2. EntityInsertAction       ← from persist()
+3. EntityUpdateAction       ← from dirty checking
+4. CollectionRemoveAction   ← removed collection elements
+5. CollectionUpdateAction   ← updated collections
+6. CollectionRecreateAction ← recreated collections
+7. EntityDeleteAction       ← from remove()
+```
+
+Inserts first, deletes last. This order is deliberate — it respects foreign key constraints automatically.
+
+---
+
+**Q4. Why does the ActionQueue execute INSERTs before DELETEs?**
+
+Foreign key constraints. If a child row references a parent row, the parent must exist before the child is inserted. Conversely, children must be deleted before parents.
+
+If Hibernate executed DELETEs first, it might try to delete a parent row that still has child rows referencing it — causing a foreign key constraint violation. By inserting parents before children and deleting children before parents, Hibernate avoids these violations automatically.
+
+---
+
+## The Four Entity States
+
+**Q5. What are the four entity states? Describe each.**
+
+**Transient** — A plain Java object with no association to any PC and no DB row. Hibernate has zero knowledge of it. GC collects it normally.
+
+**Managed** — Associated with an open PC. Hibernate tracks it via the identity map, holds a snapshot, and will auto-flush changes at commit.
+
+**Detached** — Was previously managed but the PC closed or it was explicitly detached. Has a valid ID and DB row, but changes are NOT tracked.
+
+**Removed** — Was managed, `em.remove()` was called. DELETE is enqueued in ActionQueue. Still in the PC but marked for deletion. Becomes transient after flush/commit.
+
+---
+
+**Q6. You create `Product p = new Product()` and manually set `p.setId(1L)`. Is `p` transient or detached?**
+
+**Transient.** Entity state is determined by Persistence Context association — not by whether an ID is set. `p` has never been associated with any PC, so it is transient regardless of the ID value.
+
+This matters because `em.persist(p)` on a transient entity with a manually set ID may cause an `EntityExistsException` if a row with that ID already exists.
+
+---
+
+**Q7. List every way an entity can transition from MANAGED to DETACHED.**
+
+1. Transaction commits → PC closes → all managed entities become detached
+2. `em.detach(entity)` — explicit detachment of one entity
+3. `em.clear()` — detaches ALL entities in the PC
+4. `em.close()` — closes the PC entirely
+5. Serialization and deserialization — the deserialized copy has no PC reference
+6. Passing entity across transaction boundaries in layered Spring architecture
+
+---
+
+**Q8. What happens to an entity's state after `em.flush()` followed by transaction commit?**
+
+After flush + commit, the entity becomes **DETACHED** (in a transaction-scoped PC, which is the Spring default). The PC is destroyed at transaction end. The entity object still exists in memory with its field values intact, but it is no longer tracked by any PC.
+
+---
+
+## `persist()` Internals
+
+**Q9. Does `em.persist()` immediately execute an INSERT SQL statement?**
+
+No — with one exception. `persist()` registers the entity in the identity map, creates a snapshot, and enqueues an `EntityInsertAction` in the ActionQueue. The actual INSERT SQL is deferred until flush time (commit or explicit `em.flush()`).
+
+---
+
+**Q10. What is the one exception to the deferred INSERT rule, and why?**
+
+`GenerationType.IDENTITY`. With IDENTITY, the DB generates the ID at INSERT time. Hibernate needs that ID immediately after persist (to register the entity in the identity map under the correct key). So the INSERT fires immediately upon `persist()` — it cannot be deferred. This is exactly why IDENTITY breaks JDBC batching.
+
+---
+
+**Q11. What happens if you call `em.persist()` on an already MANAGED entity?**
+
+It is a no-op. The entity is already tracked, already in the identity map, already has a snapshot. Hibernate ignores the call. No exception is thrown.
+
+---
+
+**Q12. What happens if you call `em.persist()` on a DETACHED entity?**
+
+`EntityExistsException` (or `PersistenceException` wrapping a constraint violation). The detached entity has an ID that already exists in the DB. Hibernate either detects this and throws immediately, or attempts an INSERT which fails at the DB level with a duplicate key violation.
+
+For detached entities you should use `em.merge()`, not `em.persist()`.
+
+---
+
+## `merge()` Internals
+
+**Q13. Walk through `em.merge()` on a detached entity whose ID exists in the DB.**
+
+```
+1. Is entity null?          → IllegalArgumentException
+2. Is entity REMOVED?       → IllegalArgumentException
+3. Is entity MANAGED?       → return it as-is (no-op)
+4. Is entity DETACHED (has ID)?
+   a. Check identity map: managed instance with same key exists?
+      YES → copy detached state onto existing managed instance → return it
+      NO  → SELECT from DB to load current state
+           → copy detached state onto loaded instance
+           → register loaded instance in identity map
+           → return managed instance
+5. Cascade CascadeType.MERGE to associations
+6. At flush: UPDATE if state differs from snapshot
+```
+
+---
+
+**Q14. What is wrong with this code?**
+```java
+Product detached = getDetachedProduct();
+em.merge(detached);
+em.persist(detached);
+```
+
+Two problems. First, `em.persist(detached)` after merge is wrong — `detached` is still detached after `merge()`. The managed copy is the **return value** of `merge()`, which is being ignored here.
+
+Second, `em.persist(detached)` on a detached entity (has ID) causes `EntityExistsException`.
+
+Correct code:
+```java
+Product managed = em.merge(detached); // use the return value
+// managed is now tracked — no need to persist
+```
+
+---
+
+**Q15. What does `merge()` do with a completely TRANSIENT entity (no ID)?**
+
+Treats it like `persist()` — creates a new managed copy, enqueues an INSERT, returns the managed instance. The original transient object remains transient.
+
+```java
+Product transient = new Product("Widget"); // no ID
+Product managed = em.merge(transient);
+// managed is a new tracked instance
+// INSERT enqueued
+// transient is still transient
+```
+
+---
+
+**Q16. What does `merge()` do with an already MANAGED entity?**
+
+Returns the same entity as-is. It's already tracked, already in the identity map. No SELECT, no copy, no extra work. Complete no-op.
+
+---
+
+**Q17. Does the detached instance itself ever become managed after `merge()`?**
+
+Never. `merge()` always returns a different managed instance (or the same one if already managed). The detached object passed in remains detached permanently. This is the most common merge misconception.
+
+```java
+Product detached = ...;
+Product managed = em.merge(detached);
+
+em.contains(detached); // always FALSE
+em.contains(managed);  // TRUE
+detached == managed;   // FALSE (different objects)
+```
+
+---
+
+## `remove()` and `refresh()` Internals
+
+**Q18. You want to delete a detached entity. What sequence of operations is needed?**
+
+```java
+// WRONG:
+em.remove(detached); // IllegalArgumentException
+
+// CORRECT:
+Product managed = em.merge(detached); // get managed copy
+em.remove(managed);                   // now remove the managed copy
+// At flush: DELETE FROM products WHERE id=?
+```
+
+`remove()` requires a MANAGED entity. Detached entities have no PC association, so Hibernate cannot schedule their deletion.
+
+---
+
+**Q19. What happens if you call `em.persist()` on a REMOVED entity before flush?**
+
+The removal is cancelled — the entity is rescheduled for INSERT. It transitions back to MANAGED. This is valid JPA behavior, though rarely intentional.
+
+Practical scenario: you remove an entity inside a conditional block, then realize the condition was wrong and call persist() to undo it. Works, but confusing code.
+
+---
+
+**Q20. What does `em.refresh()` do to pending unsaved changes?**
+
+Completely overwrites them. `refresh()` fires a SELECT against the DB and replaces the entire in-memory state with the fresh DB data. All pending changes are silently discarded. The snapshot is also reset to the fresh DB state.
+
+```java
+Product p = em.find(Product.class, 1L); // name="Widget"
+p.setName("Gadget"); // pending change
+em.refresh(p);       // SELECT fires, name back to "Widget"
+// "Gadget" is gone forever
+```
+
+---
+
+**Q21. What exception does `em.refresh()` throw if called on a detached entity?**
+
+`IllegalArgumentException` — because refresh requires a MANAGED entity. If the entity's DB row doesn't exist anymore (deleted by another process), it throws `EntityNotFoundException`.
+
+---
+
+## Dirty Checking
+
+**Q22. How many UPDATE statements does this produce?**
+```java
+Product p = em.find(Product.class, 1L);
+p.setName("A");
+p.setName("B");
+p.setName("C");
+```
+
+**One UPDATE.** Dirty checking is snapshot-based, not event-based. Hibernate does not listen to setter calls. At flush time it compares the original snapshot (name="Widget") against the final current state (name="C"). Only one UPDATE: `SET name='C'`. The intermediate values "A" and "B" are completely irrelevant.
+
+---
+
+**Q23. If you load an entity, make no changes, and commit — does Hibernate execute an UPDATE?**
+
+No. Dirty checking compares snapshot against current state. If they are identical, no dirty fields are detected and no UPDATE is generated. This is a key performance feature — read-only loads within a transaction produce zero write SQL.
+
+---
+
+**Q24. What is the performance concern with dirty checking in large Persistence Contexts?**
+
+Dirty checking is O(n) per flush — Hibernate iterates over every managed entity in the identity map, reads all field values via reflection, and compares against snapshots. With hundreds or thousands of managed entities in one transaction, this becomes expensive.
+
+Solutions: use `em.clear()` periodically in batch jobs, use `StatelessSession` for bulk operations, or use `@Transactional(readOnly=true)` which disables dirty checking entirely via `FlushMode.MANUAL`.
+
+---
+
+**Q25. What is bytecode enhancement dirty checking vs snapshot-based?**
+
+**Snapshot-based (default):** Hibernate stores a copy of the loaded state. At flush, it compares current values against that copy using reflection. Requires storing two copies of every entity's state in memory.
+
+**Bytecode enhancement:** Hibernate's build plugin rewrites compiled `.class` files to inject a `$$_hibernate_tracker` field into the entity. Every setter call automatically marks that field as dirty. At flush, Hibernate checks the tracker — no reflection, no comparison needed. Faster flush, less memory (no snapshot copy needed).
+
+The tradeoff: bytecode enhancement requires build tooling setup and makes your compiled classes less portable.
+
+---
+
+## Identity Map
+
+**Q26. You call `em.find(Product.class, 1L)` three times in one transaction. How many SELECTs execute?**
+
+**One.** The first `find()` hits the DB and stores the result in the identity map. The second and third calls find the existing entry in the identity map and return the same instance immediately. Zero SQL for calls two and three.
+
+---
+
+**Q27. A JPQL query returns Product id=1. You previously loaded it with `em.find()`. Same instance?**
+
+Yes, same instance. JPQL queries always execute SQL (they bypass the identity map for the query itself), but after the ResultSet is loaded, Hibernate checks the identity map: "do I already have a managed instance for this key?" If yes → returns the existing instance, discards the freshly loaded data. The identity map guarantee holds even for JPQL results.
+
+---
+
+**Q28. Two different EntityManager instances each load Product id=1. Same instance?**
+
+No. The identity map is per-EntityManager (per-PC). Each EM has its own separate map. Two different EMs can have two different Java objects representing the same DB row. This is why PCs are not thread-safe — sharing one EM across threads can cause identity map corruption.
+
+---
+
+**Q29. Is the Persistence Context thread-safe?**
+
+No. The PC (`StatefulPersistenceContext`) and `EntityManager` are not thread-safe. In Spring, this is handled by the transactional proxy — each thread gets its own EntityManager bound to its own transaction via `ThreadLocal`. Never share an EntityManager across threads.
+
+---
+
+## Flush Modes
+
+**Q30. With `FlushMode.AUTO`, does Hibernate always flush before a query?**
+
+No — only when necessary. Hibernate checks whether any pending ActionQueue operations affect the tables the query is about to read. If a pending INSERT touches the `products` table and the query reads `products` → flush first. If the pending operations affect different tables → skip the flush.
+
+This is an optimization to avoid unnecessary flushes while still ensuring query consistency.
+
+---
+
+**Q31. FlushMode.COMMIT — you persist a new entity, then run a JPQL count query. Does count include it?**
+
+No. With `FlushMode.COMMIT`, Hibernate does not flush before queries. The INSERT for the new entity is still in the ActionQueue, not in the DB. The JPQL query reads from DB only → new entity is not counted.
+
+---
+
+**Q32. After persisting (FlushMode.COMMIT), does `em.find()` return the new entity?**
+
+Yes — but for a different reason than JPQL. `em.find()` checks the identity map first. The newly persisted entity is already registered there (persist() adds it to the identity map immediately). So `find()` returns it from the map without touching the DB.
+
+This is the asymmetry: JPQL queries the DB (doesn't see the new entity), but `find()` checks the identity map first (does see it). A genuine source of confusing bugs.
+
+---
+
+**Q33. What flush mode does `@Transactional(readOnly=true)` set? What's the benefit?**
+
+Sets `FlushMode.MANUAL`. This means Hibernate never flushes automatically — ever. The benefit is twofold: no pre-query flushes, and **dirty checking is completely disabled**. Hibernate doesn't bother comparing snapshots at commit because it knows no writes should happen. This reduces both CPU cost (no reflection comparison) and memory pressure (snapshots are still held but never consulted).
+
+---
+
+## Transaction Boundaries and Detachment
+
+**Q34. What is wrong with this design?**
+```java
+@Transactional
+public Order getOrder(Long id) {
+    return orderRepository.findById(id).orElseThrow();
+}
+
+public String getSummary(Long id) {
+    Order order = getOrder(id);
+    return order.getItems().stream()...;
+}
+```
+
+`getOrder()` has its own `@Transactional`. When it returns, the transaction commits and the PC closes. The returned `Order` is now DETACHED. `order.getItems()` is a lazy collection — accessing it requires an open Session, which no longer exists. Result: `LazyInitializationException: could not initialize proxy - no Session`.
+
+---
+
+**Q35. Four solutions to `LazyInitializationException`, with tradeoffs.**
+
+**1. JOIN FETCH in query:**
+```java
+@Query("SELECT o FROM Order o JOIN FETCH o.items WHERE o.id = :id")
+```
+Loads everything in one SQL. Best performance, but couples query to use case.
+
+**2. `@EntityGraph`:**
+```java
+@EntityGraph(attributePaths = {"items"})
+Order findById(Long id);
+```
+Cleaner than JOIN FETCH, declarative, still one SQL.
+
+**3. Extend the transaction scope:**
+Move `@Transactional` to the caller so the PC stays open during collection access. Risk: long transactions, lazy loading scattered across layers.
+
+**4. DTO projection:**
+```java
+@Query("SELECT new OrderDto(o.id, i.name) FROM Order o JOIN o.items i")
+```
+Never loads entities at all. Best for read-only use cases, eliminates the problem entirely.
+
+**Anti-pattern to avoid:** `spring.jpa.open-in-view=true` — keeps a Session open for the entire HTTP request. "Fixes" lazy loading but causes N+1 queries silently and holds DB connections for the full request duration.
+
+---
+
+**Q36. What is `spring.jpa.open-in-view=true` and why is it an anti-pattern?**
+
+It keeps a Hibernate Session open from the start of the HTTP request until the response is written — even after the `@Transactional` method returns. This allows lazy collections to be initialized during serialization (e.g., in JSON serializers).
+
+Why it's an anti-pattern:
+- Holds a DB connection for the entire HTTP request lifecycle
+- Lazy loading happens silently during serialization — invisible N+1 queries
+- Masks architectural problems instead of solving them
+- Under load, connection pool exhaustion becomes likely
+
+Spring Boot enables this by default (and logs a warning about it).
+
+---
+
+## Extended vs Transaction-Scoped Persistence Context
+
+**Q37. Difference between transaction-scoped and extended PC.**
+
+**Transaction-scoped (default in Spring):** PC is created when the transaction starts and destroyed when it commits or rolls back. All entities become detached after the transaction ends.
+
+**Extended PC:** PC survives transaction boundaries. The same PC (and all its managed entities) persists across multiple transactions for the lifetime of the bean. Entities stay MANAGED even when no transaction is active.
+
+---
+
+**Q38. Extended PC — load entity, close transaction, mutate, start new transaction. What happens?**
+
+The entity remains MANAGED in the extended PC even after the transaction closes. The mutation is tracked. When the new transaction starts, the PC is already associated with it. At commit of the new transaction, the dirty checking runs and the UPDATE is flushed. The change reaches the DB.
+
+---
+
+**Q39. What is the memory risk of extended Persistence Contexts?**
+
+The PC accumulates entities indefinitely. Every entity loaded during the bean's lifetime stays in the identity map and snapshot store. With no transaction boundary to trigger a clear, the PC grows unboundedly. In long-lived beans handling many requests, this causes memory pressure and increasingly slow dirty checking at flush time (more entities = more snapshot comparisons).
+
+---
+
+## ActionQueue Optimizations
+
+**Q40. `em.persist(p)` then immediately `em.remove(p)` before flush. What SQL executes?**
+
+No SQL. Hibernate's ActionQueue recognizes the paired INSERT + DELETE for the same entity within one flush cycle and cancels them both out. The net effect is zero — the entity never existed from the DB's perspective.
+
+---
+
+**Q41. Why does the answer to Q40 differ for IDENTITY vs SEQUENCE?**
+
+With **SEQUENCE**, the INSERT is deferred in the ActionQueue. Hibernate can inspect the queue, find the paired INSERT+DELETE, and cancel both before any SQL is sent.
+
+With **IDENTITY**, `persist()` fires the INSERT immediately (because the ID must be generated by the DB right away). By the time `remove()` is called, the INSERT has already executed. So Hibernate must now also execute the DELETE. Result: one INSERT + one DELETE in the DB.
+
+---
+
+**Q42. Walk through this scenario step by step:**
+```java
+@Transactional
+public void test() {
+    Product p = em.find(Product.class, 1L); // name="Widget"
+    p.setName("Gadget");
+    em.refresh(p);
+    p.setName("SuperWidget");
+}
+```
+
+```
+Step 1: em.find(Product.class, 1L)
+  → SELECT * FROM products WHERE id=1
+  → p.name = "Widget"
+  → Snapshot: {name="Widget"}
+  → p is MANAGED
+
+Step 2: p.setName("Gadget")
+  → p.name = "Gadget" in memory
+  → Snapshot still: {name="Widget"}
+  → No SQL yet
+
+Step 3: em.refresh(p)
+  → SELECT * FROM products WHERE id=1 (re-read from DB)
+  → p.name = "Widget" (DB value overwrites "Gadget")
+  → Snapshot reset: {name="Widget"}
+  → "Gadget" is permanently discarded
+
+Step 4: p.setName("SuperWidget")
+  → p.name = "SuperWidget"
+  → Snapshot: {name="Widget"}
+
+Step 5: Transaction commits → dirty check
+  → current: {name="SuperWidget"} vs snapshot: {name="Widget"}
+  → Dirty → UPDATE products SET name='SuperWidget' WHERE id=1
+```
+
+Final SQL: one SELECT (find) + one SELECT (refresh) + one UPDATE.
+
+---
+
+## State Transition Matrix
+
+**Q43. Complete state transition matrix:**
+
+| Operation | Transient | Managed | Detached | Removed |
+|---|---|---|---|---|
+| `persist()` | → Managed | No-op | EntityExistsException | → Managed (reschedules) |
+| `merge()` | → Managed copy | Returns self | → Managed copy | IllegalArgumentException |
+| `remove()` | IllegalArgumentException | → Removed | IllegalArgumentException | No-op |
+| `refresh()` | IllegalArgumentException | Re-reads DB, stays Managed | IllegalArgumentException | IllegalArgumentException |
+| `contains()` | false | true | false | true (until flush) |
+
+---
+
+## Mixed / Tricky Scenarios
+
+**Q44. `@Transactional` method calls another `@Transactional` on the same bean. Does the inner method get its own PC?**
+
+No — and this is the Spring self-invocation trap. `@Transactional` works via a proxy that wraps your bean. When you call `this.innerMethod()` directly, you bypass the proxy entirely — the transaction interceptor never runs. The inner method joins the outer transaction and uses the same PC.
+
+If called through the proxy (from another bean), the default propagation is `REQUIRED` — inner method joins the existing transaction and shares the same PC.
+
+---
+
+**Q45. Difference between `em.detach(entity)` and `em.clear()`.**
+
+`em.detach(entity)` — removes one specific entity from the PC. All other managed entities remain tracked.
+
+`em.clear()` — removes ALL entities from the PC at once. The entire identity map and all snapshots are discarded. All previously managed entities become detached simultaneously.
+
+Use `clear()` in batch processing to prevent memory buildup after processing each chunk.
+
+---
+
+**Q46. You call `em.clear()` mid-transaction after making several changes. What happens?**
+
+All pending changes are lost. `clear()` discards the entire identity map and all snapshots. Any dirty entities are simply forgotten — their `EntityUpdateAction` entries in the ActionQueue are also dropped. No UPDATE SQL will be generated for those changes at commit.
+
+```java
+Product p = em.find(Product.class, 1L);
+p.setName("Changed"); // pending change
+em.clear();           // p is now DETACHED, change is gone
+// At commit: zero UPDATE SQL — change never persisted
+```
+
+---
+
+**Q47. An entity is MANAGED. You serialize and deserialize it. What state is the deserialized copy?**
+
+**Detached.** Serialization writes the entity's field values to a byte stream. Deserialization reconstructs a new Java object from those bytes. The new object has no reference to any PC (the PC is a runtime, in-memory construct — it doesn't serialize). So the deserialized copy is detached — it has a valid ID and field values but no PC association.
+
+---
+
+**Q48. Why does `contains()` return `true` for a REMOVED entity until flush?**
+
+Because a REMOVED entity is still in the Persistence Context — it's still registered in the identity map, just marked with a "deleted" flag. `contains()` checks whether the entity is associated with the PC, not whether it's going to survive the flush. Until flush actually executes the DELETE and the entity is evicted from the PC, `contains()` returns `true`.
+
+After flush/commit, the entity is evicted from the identity map and `contains()` returns `false`.
+
+---
