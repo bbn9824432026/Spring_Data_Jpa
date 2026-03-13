@@ -1040,3 +1040,544 @@ Natural key trap:
 ```
 
 ---
+
+
+---
+
+## `@Entity` and `@Table` Basics
+
+**Q1. What does `@Entity(name = "Foo")` control vs `@Table(name = "foo")`? Give an example of a JPQL query that would break if you confuse them.**
+
+`@Entity(name)` sets the **JPQL entity name** — the name you use in HQL/JPQL queries. `@Table(name)` sets the **SQL table name** — what appears in generated SQL.
+
+```java
+@Entity(name = "Foo")
+@Table(name = "foo_table")
+public class Foo { ... }
+
+// ✅ Correct JPQL:
+"SELECT f FROM Foo f"
+
+// ❌ Breaks — JPQL doesn't know "FooEntity" or "foo_table":
+"SELECT f FROM FooEntity f"
+"SELECT f FROM foo_table f"
+```
+
+They are completely orthogonal. If you omit `@Entity(name)`, the entity name defaults to the simple class name.
+
+---
+
+**Q2. What are the four requirements Hibernate enforces on any `@Entity` class? Explain the reason behind each.**
+
+| Requirement | Reason |
+|---|---|
+| No-arg constructor (public/protected) | Hibernate instantiates objects via reflection when hydrating DB results. It needs a constructor with no arguments to do this. |
+| Class must NOT be final | Hibernate generates proxy subclasses for lazy loading using CGLIB/ByteBuddy. You can't subclass a `final` class in Java. |
+| Methods to be proxied must NOT be final | Proxies work by overriding methods. Final methods can't be overridden. |
+| Exactly one `@Id` | Every entity needs a primary key so Hibernate can track identity, cache objects, and detect changes. |
+
+---
+
+**Q3. Why can't a `final` class be a Hibernate entity in practice?**
+
+Hibernate implements lazy loading by generating a **proxy subclass** of your entity at runtime. This proxy intercepts method calls to trigger SQL loading on demand. Since Java doesn't allow subclassing `final` classes, Hibernate cannot create this proxy.
+
+The class itself can be persisted, but any **association pointing to it** (e.g., another entity with a `@ManyToOne` reference to it) cannot be lazily loaded. You'll get a proxy generation error at runtime.
+
+---
+
+**Q4. What happens at startup if you have `@Entity` on a class with no `@Id`?**
+
+Hibernate throws an exception during `SessionFactory` bootstrapping — before your application even starts accepting requests. The error is something like `No identifier specified for entity`. This is caught at startup, not at query time.
+
+---
+
+## `@Id` and `isNew()` Logic
+
+**Q5. Why is `Long id` safer than `long id` for a primary key field?**
+
+`long` (primitive) defaults to `0`. `Long` (wrapper) defaults to `null`.
+
+`SimpleJpaRepository.save()` uses this logic to decide `persist()` vs `merge()`:
+
+```
+@Id is null?  → new entity → persist() → INSERT
+@Id not null? → existing entity → merge() → SELECT then UPDATE
+```
+
+With `long`, default `0` is treated as "not null" → Hibernate assumes it's an existing entity → calls `merge()` → fires a SELECT for ID=0 → wrong behavior.
+
+With `Long`, default `null` → correctly identified as new → `persist()` → direct INSERT.
+
+---
+
+**Q6. What does `SimpleJpaRepository.save()` actually do internally? When does it call `persist()` vs `merge()`?**
+
+```java
+public <S extends T> S save(S entity) {
+    if (entityInformation.isNew(entity)) {
+        em.persist(entity);
+        return entity;
+    } else {
+        return em.merge(entity);
+    }
+}
+```
+
+`isNew()` resolution order:
+1. If entity implements `Persistable<ID>` → uses `entity.isNew()`
+2. Otherwise → checks if `@Id` field is null (or 0 for primitives)
+
+`persist()` → assumes new, fires INSERT at flush time.
+`merge()` → assumes existing, fires SELECT first, then INSERT or UPDATE.
+
+---
+
+**Q7. You have `@Id private String key` with no `@GeneratedValue`. You call `save(new Setting("timeout", "30"))`. Walk through exactly what SQL executes and why.**
+
+```
+save() called
+  → isNew() check: key = "timeout" (not null)
+  → isNew() returns false
+  → em.merge() called
+  → SELECT * FROM setting WHERE key = 'timeout'
+  → not found
+  → INSERT INTO setting (key, value) VALUES ('timeout', '30')
+```
+
+Extra SELECT on every save, even for always-new entities. Silent performance issue at scale.
+
+---
+
+**Q8. How do you fix the natural key problem from Q7? What interface do you implement and what does it do?**
+
+Implement `Persistable<ID>`:
+
+```java
+@Entity
+public class Setting implements Persistable<String> {
+
+    @Id
+    private String key;
+
+    @Transient
+    private boolean isNew = true;
+
+    @Override public String getId() { return key; }
+    @Override public boolean isNew() { return isNew; }
+
+    @PostPersist @PostLoad
+    void markNotNew() { this.isNew = false; }
+}
+```
+
+Now `save()` uses `entity.isNew()` instead of null-checking the ID. Newly constructed objects are `isNew = true` → `persist()` → direct INSERT, no SELECT. After persist or load from DB, `isNew` flips to `false`.
+
+---
+
+## `@GeneratedValue` Strategies
+
+**Q9. Why does `IDENTITY` strategy break JDBC batching? Explain the internal reason.**
+
+Hibernate's batch mechanism works by accumulating `EntityInsertAction` objects in an `ActionQueue`, then flushing them all at once via `addBatch()` / `executeBatch()`.
+
+But `IDENTITY` requires the DB-generated ID **immediately** after each INSERT (to register the object in Hibernate's identity map). This forces each INSERT to execute immediately and individually — the action can never sit in the queue.
+
+Result: 100 `persist()` calls = 100 individual INSERT statements. Batching is structurally impossible with `IDENTITY`.
+
+---
+
+**Q10. What does `allocationSize = 50` actually do? Walk through what happens on the 1st, 2nd, and 51st `persist()` call.**
+
+```
+1st persist():
+  → SELECT nextval('seq_orders') → DB returns 1
+  → Hibernate caches IDs 1–50 in memory
+  → Entity gets ID = 1
+
+2nd persist():
+  → No DB call — ID = 2 comes from in-memory pool
+
+...
+
+50th persist():
+  → No DB call — ID = 50 from pool
+
+51st persist():
+  → Pool exhausted
+  → SELECT nextval('seq_orders') → DB returns 51
+  → Hibernate caches IDs 51–100
+  → Entity gets ID = 51
+```
+
+50 entities = 1 DB sequence call. 99% reduction in roundtrips vs `allocationSize = 1`.
+
+---
+
+**Q11. Your DB sequence has `INCREMENT BY 1` but your `@SequenceGenerator` has `allocationSize = 50`. What IDs do your entities get?**
+
+```
+SELECT nextval() → DB returns 1 → Hibernate allocates 1–50
+SELECT nextval() → DB returns 2 → Hibernate allocates 51–100  ← wrong!
+SELECT nextval() → DB returns 3 → Hibernate allocates 101–150
+```
+
+Entities get IDs: 1, 2, 3... 50, 51... 100 but with completely wrong sequence alignment. In practice you get massive gaps and potentially duplicate ID assignments depending on the optimizer used.
+
+**Fix:** DB sequence must have `INCREMENT BY 50` to match `allocationSize = 50`.
+
+---
+
+**Q12. Why does `GenerationType.TABLE` perform so poorly under load?**
+
+It uses a dedicated table to simulate sequences:
+
+```sql
+SELECT next_val FROM hibernate_sequences WHERE sequence_name='orders' FOR UPDATE
+UPDATE hibernate_sequences SET next_val = next_val + 1 WHERE sequence_name='orders'
+```
+
+`FOR UPDATE` places a **pessimistic row-level lock** on that row. Every concurrent thread blocks waiting for the lock. Under load this becomes a serialization bottleneck — threads queue up waiting to increment the counter one at a time. Catastrophic throughput degradation.
+
+---
+
+**Q13. When would you ever choose `allocationSize = 1`? What's the tradeoff?**
+
+Use `allocationSize = 1` when:
+- You need **sequential IDs with no gaps** (audit requirements, human-readable order numbers)
+- Your insert volume is low enough that extra DB roundtrips don't matter
+- You're debugging and want predictable ID sequences
+
+Tradeoff: every `persist()` fires a `SELECT nextval()`. No pooling, no batching benefit from the sequence side. For high-volume inserts this is a significant performance hit.
+
+---
+
+## `@Column` and Field Mappings
+
+**Q14. Which `@Column` attributes affect DDL only? Which affect runtime SQL? Which affect both?**
+
+| Attribute | DDL | Runtime SQL |
+|---|---|---|
+| `nullable` | ✅ | ❌ |
+| `unique` | ✅ | ❌ |
+| `length` | ✅ | ❌ |
+| `precision` / `scale` | ✅ | ❌ |
+| `columnDefinition` | ✅ | ❌ |
+| `name` | ✅ | ✅ |
+| `insertable` | ❌ | ✅ |
+| `updatable` | ❌ | ✅ |
+
+---
+
+**Q15. You set `@Column(nullable = false)` but no `@NotNull`. You save an entity with a null field. At what point does an exception occur and why?**
+
+```
+setEmail(null)       → no error (JPA doesn't check)
+repository.save()    → no error (Spring doesn't check)
+Hibernate generates: INSERT INTO users (email) VALUES (null)
+DB executes SQL      → ConstraintViolationException ← error here
+```
+
+`nullable = false` is a DDL hint only. It generates `NOT NULL` in the schema but provides zero runtime protection. The null travels all the way to the database before anything complains.
+
+`@NotNull` (Bean Validation) catches it at the application layer, before SQL is even generated.
+
+---
+
+**Q16. What is `insertable = false, updatable = false` useful for? Give two real-world use cases.**
+
+**Use case 1 — DB-managed timestamps:**
+```java
+@Column(name = "created_at", insertable = false, updatable = false)
+private LocalDateTime createdAt;
+// DB default or trigger manages this value
+// Hibernate never tries to write it — only reads it
+```
+
+**Use case 2 — Reading a FK value without owning it:**
+```java
+@Column(name = "order_id", insertable = false, updatable = false)
+private Long orderId;
+// The actual FK is managed by the @JoinColumn on the association
+// This field lets you read the raw FK value without causing double-write conflicts
+```
+
+---
+
+**Q17. What does `columnDefinition = "JSONB"` do? When would you use it?**
+
+It completely overrides Hibernate's DDL type inference for that column. Instead of Hibernate deciding the SQL type from the Java type, you specify it explicitly.
+
+```java
+@Column(columnDefinition = "JSONB")
+private String metadata;
+// DDL generates: metadata JSONB  (not VARCHAR(255))
+```
+
+Use when:
+- You need a DB-specific type Hibernate doesn't map automatically (PostgreSQL `JSONB`, `TSVECTOR`, `UUID`, etc.)
+- You need `TEXT` instead of `VARCHAR(255)` for a String field
+- You need precise control over the DDL type
+
+---
+
+**Q18. You have `@Column(length = 500)` on a `String` field. Does Hibernate truncate values longer than 500 characters at runtime?**
+
+No. `length` is DDL-only. Hibernate generates `VARCHAR(500)` in the schema, but at runtime it sends whatever value you give it to the database without any truncation or validation. The database will reject values exceeding 500 characters with a data exception. To get application-layer validation, use `@Size(max = 500)` from Bean Validation.
+
+---
+
+## `@Basic`, `@Transient`, `@Lob`
+
+**Q19. You add `@Basic(fetch = FetchType.LAZY)` to a `@Lob byte[]` field. Is it actually lazy? Why or why not?**
+
+No, it's not lazy — unless bytecode enhancement is configured. Without it, Hibernate silently ignores the `fetch = LAZY` hint and loads the field eagerly.
+
+The reason: standard proxy-based lazy loading works by generating a subclass that intercepts **method calls**. But scalar fields on the same entity are accessed via direct field access internally — the proxy subclass has no opportunity to intercept that. So the hint is simply ignored, no error, no warning.
+
+---
+
+**Q20. What is bytecode enhancement and how does it differ from the proxy approach?**
+
+**Proxy approach:** Hibernate creates a subclass of your entity at runtime. Works for lazy *associations* (related entities) because they're accessed via method calls from outside the class.
+
+**Bytecode enhancement:** Hibernate's Maven/Gradle plugin rewrites your compiled `.class` files at build time, injecting interception logic directly into field access. This makes lazy loading work for scalar fields (`@Basic`) and enables dirty checking without snapshots.
+
+Key difference: proxies are external subclasses created at runtime. Bytecode enhancement modifies the class itself at compile time. Enhancement is more powerful but requires build tooling setup.
+
+---
+
+**Q21. What's the difference between `@Transient` and the Java `transient` keyword?**
+
+| | `@Transient` | `transient` |
+|---|---|---|
+| Context | JPA persistence | Java serialization |
+| Effect | Field excluded from DB mapping | Field excluded from `ObjectOutputStream` |
+| Common usage | Computed/derived fields | Cache fields, non-serializable helpers |
+
+Both exclude a field from persistence. In practice, you often use both together on fields that are neither serializable nor persistable:
+
+```java
+@Transient
+transient private String cachedDisplayName;
+```
+
+---
+
+**Q22. `@Lob` on a `String` field in PostgreSQL maps to what type? Is that the same across all databases?**
+
+In PostgreSQL, `@Lob` on `String` maps to `TEXT`. In Oracle, it maps to `CLOB` (a true large object with OID-based storage). The behavior is dialect-specific.
+
+This matters because Oracle `CLOB` handling requires different JDBC mechanics than PostgreSQL `TEXT`. If you're writing portable code, be aware that `@Lob` doesn't guarantee identical behavior across databases.
+
+---
+
+## Enums and Converters
+
+**Q23. You have `@Enumerated(EnumType.ORDINAL)` and add a new enum value in the middle. What exactly happens to existing data? Why doesn't Hibernate warn you?**
+
+```java
+// Before:
+enum Status { PENDING, ACTIVE, CLOSED }
+// DB stores: 0, 1, 2
+
+// After adding REVIEW in the middle:
+enum Status { PENDING, REVIEW, ACTIVE, CLOSED }
+// DB stores: 0, 1, 2, 3 — but now:
+// 0=PENDING, 1=REVIEW, 2=ACTIVE, 3=CLOSED
+
+// Existing DB rows with value=1 (were ACTIVE) now read as REVIEW
+// Existing DB rows with value=2 (were CLOSED) now read as ACTIVE
+```
+
+Hibernate doesn't warn because it has no knowledge of the enum's history. It simply maps whatever integer is in the DB to the current enum's ordinal position. The corruption is silent and total.
+
+---
+
+**Q24. What is `AttributeConverter` and how is it better than `@Enumerated(EnumType.STRING)`?**
+
+`AttributeConverter` lets you define exactly how a Java type maps to a DB column value, completely decoupled from the enum's name or position:
+
+```java
+public enum Status {
+    PENDING("P"), ACTIVE("A"), CLOSED("C");
+    private final String code;
+}
+
+@Converter(autoApply = true)
+public class StatusConverter implements AttributeConverter<Status, String> {
+    public String convertToDatabaseColumn(Status s) { return s.getCode(); }
+    public Status convertToEntityAttribute(String code) { return Status.fromCode(code); }
+}
+// DB stores: "P", "A", "C"
+```
+
+Advantages over `EnumType.STRING`:
+- DB values are compact custom codes, not full enum names
+- Renaming the enum constant doesn't break existing data
+- Reordering enum constants doesn't break existing data
+- The mapping contract is explicit and centralized
+
+---
+
+**Q25. What does `@Converter(autoApply = true)` do? How do you disable it for a specific field?**
+
+`autoApply = true` tells Hibernate to automatically apply this converter to **every field** of the matching Java type across all entities, without needing `@Convert` on each field.
+
+To disable for a specific field:
+```java
+@Convert(disableConversion = true)
+private Status rawStatus; // converter not applied here
+```
+
+---
+
+**Q26. At what point in Hibernate's lifecycle is `convertToDatabaseColumn()` called? And `convertToEntityAttribute()`?**
+
+`convertToDatabaseColumn()` — called when Hibernate binds values to a `PreparedStatement` (during INSERT/UPDATE at flush time).
+
+`convertToEntityAttribute()` — called when Hibernate reads from a `ResultSet` (during SELECT / entity hydration).
+
+Also worth noting: during dirty checking, Hibernate stores the DB column value (post-conversion) in its snapshot. So the converter participates in change detection too.
+
+---
+
+## Naming Strategies
+
+**Q27. What does Spring Boot's `SpringPhysicalNamingStrategy` do? Give three examples.**
+
+It converts `camelCase` identifiers to `snake_case` and lowercases everything.
+
+```
+ProductCategory  →  product_category   (class → table)
+createdAt        →  created_at         (field → column)
+customerEmail    →  customer_email     (field → column)
+```
+
+No pluralization — `Product` becomes `product`, not `products`.
+
+---
+
+**Q28. If you switch from Spring Boot's naming strategy to Hibernate's default, what breaks and why?**
+
+Hibernate's default `PhysicalNamingStrategyStandardImpl` keeps names exactly as-is — no transformation.
+
+```
+createdAt   →  createdAt    (not created_at)
+UserAccount →  UserAccount  (not user_account)
+```
+
+On case-sensitive databases (PostgreSQL with quoted identifiers, for example), this breaks queries against columns that were created with `snake_case` names. Existing data is inaccessible because Hibernate generates SQL with wrong column names.
+
+---
+
+**Q29. You have `private String createdAt`. Do you need `@Column(name = "created_at")` in a Spring Boot app?**
+
+No. Spring Boot's `SpringPhysicalNamingStrategy` automatically converts `createdAt` → `created_at`. The `@Column(name = "created_at")` is redundant.
+
+You only need explicit `@Column(name = ...)` when you want to deviate from the convention — for example, if your column is named something unexpected like `create_timestamp`.
+
+---
+
+**Q30. What's the difference between `ImplicitNamingStrategy` and `PhysicalNamingStrategy`?**
+
+They work in sequence:
+
+```
+Java class/field name
+  ↓ ImplicitNamingStrategy → logical name (when no @Table/@Column specified)
+  ↓ PhysicalNamingStrategy → physical SQL name (always applied)
+```
+
+`ImplicitNamingStrategy` — determines the logical name when no explicit annotation is present. For example, how to name a join table for a `@ManyToMany`.
+
+`PhysicalNamingStrategy` — transforms any name (explicit or implicit) into the final SQL identifier. This is where `camelCase → snake_case` happens in Spring Boot.
+
+---
+
+## Mixed / Tricky Scenarios
+
+**Q31. `allocationSize = 50`, you persist 51 entities in one transaction. How many times is the DB sequence queried?**
+
+**2 times.**
+
+```
+1st persist  → SELECT nextval() → pool filled with IDs 1–50
+2nd–50th     → no DB calls, IDs from pool
+51st persist → pool exhausted → SELECT nextval() → pool filled with 51–100
+```
+
+Flush at end of transaction → batch INSERT of all 51 entities.
+
+---
+
+**Q32. You use Lombok `@Data` and forget `@NoArgsConstructor`. What happens and when?**
+
+`@Data` generates a constructor with all fields as parameters — but no no-arg constructor. Hibernate requires a no-arg constructor to instantiate entities during hydration (reading from DB).
+
+The failure happens at **runtime** when Hibernate first tries to load this entity from the DB. It throws `HibernateException: Unable to instantiate default constructor`. It does not fail at compile time or startup in all configurations.
+
+---
+
+**Q33. `@Column(unique = true)` vs `@UniqueConstraint` in `@Table` — what's the difference?**
+
+Both generate a `UNIQUE` constraint in DDL. The differences are:
+
+| | `@Column(unique = true)` | `@UniqueConstraint` in `@Table` |
+|---|---|---|
+| Scope | Single column | Single or multiple columns |
+| Constraint name | Auto-generated | Explicitly named |
+| Composite unique | ❌ Not possible | ✅ Yes |
+
+```java
+// Composite unique constraint (only possible via @Table):
+@Table(uniqueConstraints = @UniqueConstraint(
+    name = "uk_user_email_tenant",
+    columnNames = {"email", "tenant_id"}
+))
+```
+
+Neither enforces uniqueness at the JPA layer — both are DDL only.
+
+---
+
+**Q34. You want a field that Hibernate can read from the DB but never write. What annotations do you use?**
+
+```java
+@Column(insertable = false, updatable = false)
+private LocalDateTime createdAt;
+```
+
+`insertable = false` — excluded from INSERT SQL.
+`updatable = false` — excluded from UPDATE SQL.
+
+Hibernate reads the value from SELECT results but never includes it in write operations. Typically used for columns managed by DB defaults or triggers.
+
+---
+
+**Q35. Why does `@Temporal` exist, and when do you NOT need it?**
+
+`@Temporal` exists because `java.util.Date` and `java.util.Calendar` can represent a date, a time, or a datetime — but a DB column is one specific type. `@Temporal` tells Hibernate which mapping to use.
+
+```java
+// Legacy — @Temporal required:
+@Temporal(TemporalType.TIMESTAMP)
+private Date createdAt;
+```
+
+You do **NOT** need `@Temporal` with Java 8+ date/time types — they have unambiguous mappings:
+
+```
+LocalDate      → DATE
+LocalTime      → TIME
+LocalDateTime  → TIMESTAMP
+Instant        → TIMESTAMP WITH TIME ZONE
+```
+
+Never use `java.util.Date` in new code. Use `LocalDateTime` or `Instant` instead.
+
+---
+
+
+
+
